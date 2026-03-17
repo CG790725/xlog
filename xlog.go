@@ -19,14 +19,13 @@ const (
 // XLogger 异步日志记录器（对应C++的XSimpleLogEx）
 type XLogger struct {
 	config     *Config
-	logChan    chan string        // 日志通道
-	wg         sync.WaitGroup     // 等待组
-	stopChan   chan struct{}      // 停止信号
-	fileHandle *os.File           // 当前日志文件句柄
-	logPath    string             // 当前日志文件路径
-	mu         sync.Mutex         // 互斥锁
-	rotator    *LogRotator        // 日志轮转器
-	compressor *LogCompressor     // 日志压缩器
+	logChan    chan string    // 日志通道
+	wg         sync.WaitGroup // 等待组
+	stopChan   chan struct{}  // 停止信号
+	logPath    string         // 当前日志文件路径
+	mu         sync.Mutex     // 互斥锁
+	rotator    *LogRotator    // 日志轮转器
+	compressor *LogCompressor // 日志压缩器
 }
 
 // NewXLogger 创建新的异步日志记录器
@@ -46,10 +45,7 @@ func NewXLogger(config *Config) (*XLogger, error) {
 		return nil, fmt.Errorf("创建日志目录失败: %v", err)
 	}
 
-	// 初始化日志文件
-	if err := logger.openLogFile(); err != nil {
-		return nil, err
-	}
+	logger.logPath = logger.getLogPath()
 
 	// 创建日志轮转器
 	if config.AutoCleanup {
@@ -81,44 +77,6 @@ func NewXLogger(config *Config) (*XLogger, error) {
 	logger.Log("** Log Start ***************************")
 
 	return logger, nil
-}
-
-// openLogFile 打开日志文件
-func (l *XLogger) openLogFile() error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	// 关闭旧文件
-	if l.fileHandle != nil {
-		l.fileHandle.Sync()
-		l.fileHandle.Close()
-	}
-
-	// 获取新的日志文件路径
-	logPath := l.getLogPath()
-
-	// 如果路径没变，不需要重新打开
-	if l.logPath == logPath && l.fileHandle != nil {
-		return nil
-	}
-
-	l.logPath = logPath
-
-	// 打开/创建日志文件
-	file, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-	if err != nil {
-		return fmt.Errorf("打开日志文件失败: %v", err)
-	}
-
-	// 检查文件是否为空
-	fileInfo, _ := file.Stat()
-	if fileInfo.Size() == 0 && !l.config.UTF8Format {
-		// 写入UTF-16 BOM（与C++版本保持一致）
-		file.Write([]byte{0xFF, 0xFE})
-	}
-
-	l.fileHandle = file
-	return nil
 }
 
 // getLogPath 获取日志文件路径
@@ -177,8 +135,10 @@ func (l *XLogger) logWriter() {
 				buffer = buffer[:0]
 			}
 
-			// 检查是否需要切换日志文件（跨天）
-			l.openLogFile()
+			l.mu.Lock()
+			l.logPath = l.getLogPath()
+			currentLogPath := l.logPath
+			l.mu.Unlock()
 
 			// 执行日志清理
 			if l.rotator != nil {
@@ -187,7 +147,7 @@ func (l *XLogger) logWriter() {
 
 			// 执行日志压缩
 			if l.compressor != nil {
-				l.compressor.Compress(l.logPath)
+				l.compressor.Compress(currentLogPath)
 			}
 
 		case <-l.stopChan:
@@ -203,22 +163,23 @@ func (l *XLogger) logWriter() {
 // flushLogs 将日志批量写入文件
 func (l *XLogger) flushLogs(logs []string) {
 	l.mu.Lock()
-	defer l.mu.Unlock()
+	logPath := l.getLogPath()
+	l.logPath = logPath
+	l.mu.Unlock()
 
-	if l.fileHandle == nil {
+	file, err := l.openLogFile(logPath)
+	if err != nil {
 		return
 	}
+	defer file.Close()
 
 	for _, log := range logs {
-		if l.config.UTF8Format {
-			l.fileHandle.WriteString(log)
-		} else {
-			// UTF-16编码（简化处理，实际应使用utf16编码）
-			l.fileHandle.WriteString(log)
+		if _, err := file.Write(l.encodeLogContent(log)); err != nil {
+			return
 		}
 	}
 
-	l.fileHandle.Sync()
+	file.Sync()
 }
 
 // Log 记录日志（INFO级别）
@@ -250,14 +211,13 @@ func (l *XLogger) LogEx(level int, format string, args ...interface{}) {
 func (l *XLogger) Close() {
 	close(l.stopChan)
 	l.wg.Wait()
+}
 
-	l.mu.Lock()
-	if l.fileHandle != nil {
-		l.fileHandle.Sync()
-		l.fileHandle.Close()
-		l.fileHandle = nil
+func (l *XLogger) encodeLogContent(log string) []byte {
+	if l.config.UTF8Format {
+		return []byte(log)
 	}
-	l.mu.Unlock()
+	return encodeUTF16LE(log)
 }
 
 // getGoroutineID 获取当前goroutine ID（简化版本）
