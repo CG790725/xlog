@@ -151,11 +151,18 @@ func (l *XLogger) logWriter() {
 			}
 
 		case <-l.stopChan:
-			// 停止信号，写入剩余日志
-			if len(buffer) > 0 {
-				l.flushLogs(buffer)
+			// 停止时继续取尽通道中的剩余日志，避免秒退场景丢尾日志
+			for {
+				select {
+				case log := <-l.logChan:
+					buffer = append(buffer, log)
+				default:
+					if len(buffer) > 0 {
+						l.flushLogs(buffer)
+					}
+					return
+				}
 			}
-			return
 		}
 	}
 }
